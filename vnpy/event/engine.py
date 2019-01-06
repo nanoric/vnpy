@@ -57,6 +57,7 @@ class PriorityQueue(Generic[P, T]):
 
 n = 0
 
+
 class EventEngine:
     """
     Event engine distributes event object based on its type 
@@ -97,7 +98,12 @@ class EventEngine:
     def emit(self, type: str, data: Any):
         self._queue.put(Event(type, data), block=False)
 
-    def single_shot(self, func: Callable, delay: float = 0, timepoint: Optional[datetime] = None):
+    def single_shot(
+            self,
+            func: Callable,
+            delay: float = 0,
+            timepoint: Optional[datetime] = None
+    ):
         """
         :param delay: delay in seconds.
         """
@@ -155,8 +161,14 @@ class EventEngine:
 
 class Timer:
 
-    def __init__(self, event_engine: EventEngine, interval: float, func: Callable,
-                 args=None, kwargs=None):
+    def __init__(
+            self,
+            event_engine: EventEngine,
+            interval: float,
+            func: Callable,
+            args=None,
+            kwargs=None
+    ):
         """
         :param interval: interval in seconds
         """
@@ -177,14 +189,14 @@ class Timer:
     def start(self):
         self._last_triggered = datetime.now()
         self.event_engine.single_shot(
-            self.on_timeout,
+            self._on_timeout,
             timepoint=self._last_triggered + timedelta(seconds=self.interval)
         )
 
-    def on_timeout(self):
+    def _on_timeout(self):
         self._last_triggered = datetime.now()
         self.event_engine.single_shot(
-            self.on_timeout,
+            self._on_timeout,
             timepoint=self._last_triggered + timedelta(seconds=self.interval)
         )
         self.func(*self.args, **self.kwargs)
