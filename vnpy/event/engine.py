@@ -1,28 +1,61 @@
-from queue import Queue, Empty
-from threading import Thread, Timer
+import heapq
 from collections import defaultdict
-from time import sleep
-from typing import Any, Callable
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from queue import Empty, Queue
+from threading import (Lock, Thread)
+from typing import Any, Callable, Dict, Generic, List, Optional, Tuple, TypeVar
 
 EVENT_TIMER = "eTimer"
 
 
+@dataclass
 class Event:
     """
     Event object consists of a type string which is used 
     by event engine for distributing event, and a data 
     object which contains the real data. 
     """
-
-    def __init__(self, type: str, data: Any = None):
-        """"""
-        self.type = type
-        self.data = data
+    type: str
+    data: Any
 
 
 # Defines handler function to be used in event engine.
 HandlerType = Callable[[Event], None]
 
+P = TypeVar('P')
+T = TypeVar('T')
+
+
+class PriorityQueue(Generic[P, T]):
+
+    def __init__(self):
+        self._data: List[T] = []
+        self._counter = 0
+
+    def push(self, val: T, priority: P, first=False):
+        """
+        :param priority: smaller one gets higher priority
+        """
+        if first:
+            heapq.heappush(self._data, (priority, 0, val))
+        else:
+            heapq.heappush(self._data, (priority, self._counter, val))
+            self._counter += 1
+
+    def pop(self) -> T:
+        priority, _, task = heapq.heappop(self._data)
+        return priority, task
+
+    def peek(self) -> Tuple[P, T]:
+        priority, _, task = self._data[0]
+        return priority, task
+
+    def __bool__(self):
+        return bool(self._data)
+
+
+n = 0
 
 class EventEngine:
     """
@@ -33,107 +66,125 @@ class EventEngine:
     which can be used for timing purpose.
     """
 
-    def __init__(self, interval: int = 1):
+    def __init__(self):
         """
-        Timer event is generated every 1 second by default, if
-        interval not specified.
         """
-        self._interval = interval
-        self._queue = Queue()
-        self._active = False
-        self._thread = Thread(target=self._run)
-        self._timer = Thread(target=self._run_timer)
-        self._handlers = defaultdict(list)
-        self._general_handlers = []
-
-    def _run(self):
-        """
-        Get event from queue and then process it.
-        """
-        while self._active:
-            try:
-                event = self._queue.get(block=True, timeout=1)
-                self._process(event)
-            except Empty:
-                pass
-
-    def _process(self, event: Event):
-        """
-        First ditribute event to those handlers registered listening
-        to this type. 
-        
-        Then distrubute event to those general handlers which listens
-        to all types.
-        """
-        if event.type in self._handlers:
-            [handler(event) for handler in self._handlers[event.type]]
-
-        if self._general_handlers:
-            [handler(event) for handler in self._general_handlers]
-
-    def _run_timer(self):
-        """
-        Sleep by interval second(s) and then generate a timer event.
-        """
-        while self._active:
-            sleep(self._interval)
-            event = Event(EVENT_TIMER)
-            self.put(event)
+        self._queue: Queue[Event] = Queue()
+        self._handlers: Dict[str, List[HandlerType]] = defaultdict(list)
+        self._single_shots: PriorityQueue[datetime, Callable] = PriorityQueue()
+        self._new_single_shots: List[Tuple[datetime, Callable]] = []
+        self._new_single_shots_lock = Lock()
+        self._loop_thread: Thread = None
+        self._keep_alive = False
 
     def start(self):
-        """
-        Start event engine to process events and generate timer events.
-        """
-        self._active = True
-        self._thread.start()
-        self._timer.start()
+        self._keep_alive = True
+        self._loop_thread = Thread(target=self._loop)
+        self._loop_thread.start()
 
     def stop(self):
-        """
-        Stop event engine.
-        """
-        self._active = False
-        self._timer.join()
-        self._thread.join()
+        self._keep_alive = False
 
-    def put(self, event: Event):
-        """
-        Put an event object into event queue.
-        """
-        self._queue.put(event)
+    def join(self):
+        self._loop_thread.join()
 
     def register(self, type: str, handler: HandlerType):
         """
-        Register a new handler function for a specific event type. Every 
-        function can only be registered once for each event type.
+        :note unregister is currently not supported
         """
-        handler_list = self._handlers[type]
-        if handler not in handler_list:
-            handler_list.append(handler)
+        self._handlers[type].append(handler)
 
-    def unregister(self, type: str, handler: HandlerType):
-        """
-        Unregister an existing handler function from event engine.
-        """
-        handler_list = self._handlers[type]
+    def emit(self, type: str, data: Any):
+        self._queue.put(Event(type, data), block=False)
 
-        if handler in handler_list:
-            handler_list.remove(handler)
+    def single_shot(self, func: Callable, delay: float = 0, timepoint: Optional[datetime] = None):
+        """
+        :param delay: delay in seconds.
+        """
+        if not timepoint:
+            timepoint = datetime.now() + timedelta(seconds=delay)
+        with self._new_single_shots_lock:
+            self._new_single_shots.append((timepoint, func))
 
-        if not handler_list:
-            self._handlers.pop(type)
+    def _loop(self):
+        while self._keep_alive:
+            # push all new single_shots first
+            self._push_all_single_shot()
 
-    def register_general(self, handler: HandlerType):
-        """
-        Register a new handler function for all event types. Every 
-        function can only be registered once for each event type.
-        """
-        if handler not in self._general_handlers:
-            self._general_handlers.append(handler)
+            # check if there is single shots:
+            if self._single_shots:
+                now = datetime.now()
+                trigger_point, func = self._single_shots.peek()
+                if trigger_point <= now:
+                    # timer should be triggered
+                    self._single_shots.pop()
+                    self._dispatch_single_shot(func)
+                    global n
+                    n += 1
+                else:
+                    max_delay = trigger_point - now
+                    try:
+                        task = self._queue.get(True, max_delay.seconds)
+                        self._dispatch(task)
+                    except Empty:
+                        # no normal task, dispatch timer
+                        pass
+            else:
+                try:
+                    task = self._queue.get(False)
+                    self._dispatch(task)
+                except Empty:
+                    pass
+        return
 
-    def unregister_general(self, handler: HandlerType):
+    def _dispatch_single_shot(self, func):
+        func()
+        pass
+
+    def _push_all_single_shot(self):
+        with self._new_single_shots_lock:
+            items = self._new_single_shots
+            self._new_single_shots = []
+        for timepoint, func in items:
+            self._single_shots.push(func, timepoint)
+
+    def _dispatch(self, task: Event):
+        for func in self._handlers[task.type]:
+            func(task)
+
+
+class Timer:
+
+    def __init__(self, event_engine: EventEngine, interval: float, func: Callable,
+                 args=None, kwargs=None):
         """
-        Unregister an existing general handler function.
+        :param interval: interval in seconds
         """
-        if handler in self._general_handlers:
-            self._general_handlers.remove(handler)
+        if args is None:
+            args = []
+        if kwargs is None:
+            kwargs = {}
+
+        self.func = func
+        self.interval = interval
+        self.event_engine = event_engine
+
+        self.args = args
+        self.kwargs = kwargs
+
+        self._last_triggered: datetime = None
+
+    def start(self):
+        self._last_triggered = datetime.now()
+        self.event_engine.single_shot(
+            self.on_timeout,
+            timepoint=self._last_triggered + timedelta(seconds=self.interval)
+        )
+
+    def on_timeout(self):
+        self._last_triggered = datetime.now()
+        self.event_engine.single_shot(
+            self.on_timeout,
+            timepoint=self._last_triggered + timedelta(seconds=self.interval)
+        )
+        self.func(*self.args, **self.kwargs)
