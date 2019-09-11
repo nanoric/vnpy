@@ -25,6 +25,7 @@ before_script:
 script:
   - cd tests; source travis_env.sh;
   - python test_all.py
+  - echo "Trigger Build"
 
 matrix:
   include:
